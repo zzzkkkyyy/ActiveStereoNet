@@ -14,90 +14,6 @@ iterations = 20000
 initial_lr = 1e-3
 disparity_range = 16
 
-# reference: https://github.com/mrharicot/monodepth/blob/master/bilinear_sampler.py
-def bilinear_sampler_1d_h(input_images, x_offset, wrap_mode='border', name='bilinear_sampler', **kwargs):
-    def _repeat(x, n_repeats):
-        with tf.variable_scope('_repeat'):
-            rep = tf.tile(tf.expand_dims(x, 1), [1, n_repeats])
-            return tf.reshape(rep, [-1])
-
-    def _interpolate(im, x, y):
-        with tf.variable_scope('_interpolate'):
-            _edge_size = 0
-            if _wrap_mode == 'border':
-                _edge_size = 1
-                im = tf.pad(im, [[0, 0], [1, 1], [1, 1], [0, 0]], mode='CONSTANT')
-                x = x + _edge_size
-                y = y + _edge_size
-            elif _wrap_mode == 'edge':
-                _edge_size = 0
-            else:
-                return None
-
-            x = tf.clip_by_value(x, 0.0,  _width_f - 1 + 2 * _edge_size)
-
-            x0_f = tf.floor(x)
-            y0_f = tf.floor(y)
-            x1_f = x0_f + 1
-
-            x0 = tf.cast(x0_f, tf.int32)
-            y0 = tf.cast(y0_f, tf.int32)
-            x1 = tf.cast(tf.minimum(x1_f,  _width_f - 1 + 2 * _edge_size), tf.int32)
-
-            dim2 = (_width + 2 * _edge_size)
-            dim1 = (_width + 2 * _edge_size) * (_height + 2 * _edge_size)
-            base = _repeat(tf.range(_num_batch) * dim1, _height * _width)
-            base_y0 = base + y0 * dim2
-            idx_l = base_y0 + x0
-            idx_r = base_y0 + x1
-
-            im_flat = tf.reshape(im, tf.stack([-1, _num_channels]))
-
-            pix_l = tf.gather(im_flat, idx_l)
-            pix_r = tf.gather(im_flat, idx_r)
-
-            weight_l = tf.expand_dims(x1_f - x, 1)
-            weight_r = tf.expand_dims(x - x0_f, 1)
-
-            return weight_l * pix_l + weight_r * pix_r
-
-    def _transform(input_images, x_offset):
-        with tf.variable_scope('transform'):
-            x_t, y_t = tf.meshgrid(tf.linspace(0.0,   _width_f - 1.0,  _width),
-                                   tf.linspace(0.0 , _height_f - 1.0 , _height))
-
-            x_t_flat = tf.reshape(x_t, (1, -1))
-            y_t_flat = tf.reshape(y_t, (1, -1))
-
-            x_t_flat = tf.tile(x_t_flat, tf.stack([_num_batch, 1]))
-            y_t_flat = tf.tile(y_t_flat, tf.stack([_num_batch, 1]))
-
-            x_t_flat = tf.reshape(x_t_flat, [-1])
-            y_t_flat = tf.reshape(y_t_flat, [-1])
-
-            x_t_flat = x_t_flat + tf.reshape(x_offset, [-1]) * _width_f
-
-            input_transformed = _interpolate(input_images, x_t_flat, y_t_flat)
-
-            output = tf.reshape(
-                input_transformed, tf.stack([_num_batch, _height, _width, _num_channels]))
-            return output
-
-    with tf.variable_scope(name):
-        _num_batch    = tf.shape(input_images)[0]
-        _height       = tf.shape(input_images)[1]
-        _width        = tf.shape(input_images)[2]
-        _num_channels = tf.shape(input_images)[3]
-
-        _height_f = tf.cast(_height, tf.float32)
-        _width_f  = tf.cast(_width,  tf.float32)
-
-        _wrap_mode = wrap_mode
-
-        output = _transform(input_images, x_offset)
-        return output
-
-
 def residual_block(image):
     layer1 = tf.layers.conv2d(image, filters=siamese_channels, kernel_size=3, padding='same')
     layer1 = tf.nn.leaky_relu(tf.layers.batch_normalization(layer1))
@@ -105,20 +21,20 @@ def residual_block(image):
     return tf.add(layer2, image)
 
 def siamese_network(image):
-    #layer = tf.stack([tf.image.per_image_standardization(item) for item in tf.unstack(image, num=batch_size)])
+    layer = tf.stack([tf.image.per_image_standardization(item) for item in tf.unstack(image, num=batch_size)])
     layer = image
     for i in range(3):
-        #with tf.variable_scope('conv' + str(i), reuse=tf.AUTO_REUSE):
         layer = tf.layers.conv2d(layer, filters=(2 ** (i - 2)) * siamese_channels, kernel_size=5, padding='same', strides=2)
     for i in range(3):
-        #with tf.variable_scope('residual' + str(i), reuse=tf.AUTO_REUSE):
         layer = residual_block(layer)
+    #layer = tf.layers.conv2d(layer, filters=1, kernel_size=5, padding='same', strides=1)
     return layer
 
 def cost_volume(left_image, right_image):
     cost_volume_list = []
+    costant_disp_shape = right_image.get_shape()[:]
     for disp in range(disparity_range):
-        right_moved = image_bias_move(right_image, tf.constant(disp + 1, shape=right_image.get_shape()), batch_size)
+        right_moved = image_bias_move(right_image, tf.constant(disp + 1, shape=costant_disp_shape), batch_size)
         cost_volume_list.append(tf.concat([left_image, right_moved], axis=-1))
     cost_volume = tf.stack(cost_volume_list, axis=1)
     
@@ -182,12 +98,6 @@ def active_stereo_net(left_input, right_input):
         cost_map = cost_volume(left_siamese, right_siamese)
         for i in range(3):
             cost_map = tf.layers.conv2d_transpose(cost_map, filters=1, kernel_size=3, padding='same', strides=2)
-        """
-        new_shape = cost_map.get_shape().as_list()
-        new_shape[1] *= 8
-        new_shape[2] *= 8
-        cost_map = tf.image.resize_images(cost_map, [new_shape[1], new_shape[2]])
-        """
         tf.summary.image("cost_map", cost_map, 2)
         """
         invalid_map = tf.squeeze(invalidation_network(cost_input))
@@ -212,25 +122,29 @@ def active_stereo_net(left_input, right_input):
     return tf.add(output, cost_map)
 
 def image_bias_move(image, disparity_map, batch_size=batch_size):
-    """
     new_shape = [batch_size, image.get_shape()[1], image.get_shape()[2], image.get_shape()[3]]
     per_image_length = image.get_shape()[1] * image.get_shape()[2] * image.get_shape()[3]
     arr = tf.reshape(tf.tile(tf.expand_dims(tf.range(image.get_shape()[1]), axis=1), [1, image.get_shape()[-1]]), [-1])
     per_arr = tf.reshape(tf.tile(tf.expand_dims(arr, axis=1), [1, image.get_shape()[1]]), [1, per_image_length])
-    index_arr = tf.clip_by_value(tf.to_int32(tf.tile(per_arr, [batch_size, 1])) - tf.to_int32(tf.reshape(disparity_map, [batch_size, per_image_length])), 0, image.get_shape()[1] - 1)
+    index_arr = tf.clip_by_value(tf.to_float(tf.tile(per_arr, [batch_size, 1])) - tf.to_float(tf.reshape(disparity_map, [batch_size, per_image_length])), 0., tf.to_float(image.get_shape()[1] - 1))
     initial_arr = tf.reshape(tf.tile(tf.expand_dims(tf.range(per_image_length * batch_size, delta=image.get_shape()[2] * image.get_shape()[3]), axis=1), (1, image.get_shape()[2] * image.get_shape()[3])), [batch_size, per_image_length])
-    #batch_arr = tf.tile(tf.expand_dims(initial_arr, axis=0), [batch_size, 1]) + tf.tile(tf.expand_dims(tf.range(batch_size * per_image_length, delta=per_image_length), axis=1), [1, per_image_length])
-    #batch_arr = tf.reshape(tf.tile(tf.expand_dims(tf.range(batch_size * per_image_length, delta=per_image_length), axis=1), [1, per_image_length]), [batch_size, per_image_length])
+
+    initial_arr = tf.to_float(initial_arr)
     index_array = tf.reshape(initial_arr + index_arr, [-1])
-    index_array = tf.expand_dims(index_array, axis=1)
-    return tf.reshape(tf.gather_nd(tf.reshape(image, [-1]), index_array), new_shape)
-    """
-    return bilinear_sampler_1d_h(image, disparity_map)
+    
+    index_array_low = tf.clip_by_value(tf.to_int32(tf.floor(index_array)), 0, image.get_shape()[1] - 1)
+    index_array_high = tf.clip_by_value(tf.to_int32(index_array_low + 1), 0, image.get_shape()[1] - 1)
+    weight_low = tf.to_float(index_array_high) - index_array
+    weight_high = index_array - tf.to_float(index_array_low)
+
+    new_image = tf.gather(tf.reshape(image, [-1]), index_array_low) * weight_low + tf.gather(tf.reshape(image, [-1]), index_array_high) * weight_high
+    return tf.reshape(new_image, new_shape)
+
 
 # add LCN, window-optimizer and invalidation net later
 def loss_func(left_input, right_input, disparity_map):
-    right = stn(image_bias_move(right_input, disparity_map))
-    left = stn(left_input)
+    right = image_bias_move(right_input, disparity_map)
+    left = left_input
     tf.summary.image('left', left, 2)
     tf.summary.image('right', right, 2)
     tf.summary.image('disparity', disparity_map, 2)
@@ -302,9 +216,6 @@ class batch_dataset:
         return np.array([list(item[0]) for item in ll]), np.array([list(item[1]) for item in ll])
 
 def main(argv=None):
-    print("init reading...")
-    reader = batch_dataset(batch_size)
-    
     print("constructing network...")
     x_placeholder = tf.placeholder(tf.float32, shape=(batch_size, length, length, 1), name='x_placeholder')
     y_placeholder = tf.placeholder(tf.float32, shape=(batch_size, length, length, 1), name='y_placeholder')
@@ -321,6 +232,9 @@ def main(argv=None):
         optimizer = tf.train.RMSPropOptimizer(learning_rate=learning_rate)
         grads = optimizer.compute_gradients(loss, var_list=var_list)
         train_op = optimizer.apply_gradients(grads)
+    
+    print("init reading...")
+    reader = batch_dataset(batch_size)
 
     print("begin running...")
     merged = tf.summary.merge_all()
@@ -332,12 +246,8 @@ def main(argv=None):
         global_steps += 1
         left, right = reader.read_next_batch()
         summary, Loss, _ = sess.run([merged, loss, train_op], feed_dict={x_placeholder: left, y_placeholder: right})
-        if (i + 1) % 25 == 0:
+        if (i + 1) % 10 == 0:
             print("iteration:", i + 1, "------------> training loss:", Loss)
-        if (i + 1) % 50 == 0:
-            #left_test, right_test = reader.read_next_batch(is_training=False)
-            #summary, disp, loss_test, _ = sess.run([merged, disparity, loss, tf.no_op()], feed_dict={x_placeholder: left_test, y_placeholder: right_test})
-            #print("iteration:", i + 1, "------------> testing loss:", loss_test)
             summary_writer.add_summary(summary, i + 1)
     return
 
