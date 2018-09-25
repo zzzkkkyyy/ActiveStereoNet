@@ -5,13 +5,12 @@ import numpy as np
 import os, random, glob
 import scipy.misc as misc
 from skimage import io
-from stn import spatial_transformer_network as transformer
 
 siamese_channels = 64
-batch_size = 2
+batch_size = 8
 length = 64
-iterations = 20000
-initial_lr = 1e-3
+iterations = 2000
+initial_lr = 1e-4
 disparity_range = 16
 
 def residual_block(image):
@@ -44,8 +43,10 @@ def cost_volume(left_image, right_image):
         #cost_volume = tf.nn.leaky_relu(tf.layers.batch_normalization(cost_volume))
     cost_volume = tf.layers.conv3d(cost_volume, filters=1, kernel_size=3, padding='same', strides=1)
     cost_volume = tf.nn.dropout(cost_volume, keep_prob=0.5)
-    
-    return tf.reduce_sum(cost_volume * tf.nn.softmax(-cost_volume, axis=1), axis=1)
+
+    disparity_volume = tf.reshape(tf.tile(tf.expand_dims(tf.range(disparity_range), axis=1), [1, left_image.get_shape()[1] * left_image.get_shape()[2]]), [1, -1])
+    disparity_volume = tf.reshape(tf.tile(disparity_volume, [left_image.get_shape()[0], 1]), cost_volume.get_shape())
+    return tf.reduce_sum(tf.to_float(disparity_volume) * tf.nn.softmax(-cost_volume, axis=1), axis=1)
 
 def cost_volume_v2(left_image, right_image):
     new_volume = []
@@ -96,9 +97,9 @@ def active_stereo_net(left_input, right_input):
     
     with tf.variable_scope('second_part', reuse=tf.AUTO_REUSE):
         cost_map = cost_volume(left_siamese, right_siamese)
+        tf.summary.image("cost_map", cost_map, 2)
         for i in range(3):
             cost_map = tf.layers.conv2d_transpose(cost_map, filters=1, kernel_size=3, padding='same', strides=2)
-        tf.summary.image("cost_map", cost_map, 2)
         """
         invalid_map = tf.squeeze(invalidation_network(cost_input))
         invalid_map = tf.image.resize_bilinear(invalid_map, 8 * invalid_map.shape())
@@ -126,12 +127,12 @@ def image_bias_move(image, disparity_map, batch_size=batch_size):
     per_image_length = image.get_shape()[1] * image.get_shape()[2] * image.get_shape()[3]
     arr = tf.reshape(tf.tile(tf.expand_dims(tf.range(image.get_shape()[1]), axis=1), [1, image.get_shape()[-1]]), [-1])
     per_arr = tf.reshape(tf.tile(tf.expand_dims(arr, axis=1), [1, image.get_shape()[1]]), [1, per_image_length])
-    index_arr = tf.clip_by_value(tf.to_float(tf.tile(per_arr, [batch_size, 1])) - tf.to_float(tf.reshape(disparity_map, [batch_size, per_image_length])), 0., tf.to_float(image.get_shape()[1] - 1))
+    index_arr = tf.clip_by_value(tf.to_float(tf.tile(per_arr, [batch_size, 1])) + tf.to_float(tf.reshape(disparity_map, [batch_size, per_image_length])), 0., tf.to_float(image.get_shape()[1] - 1))
     initial_arr = tf.reshape(tf.tile(tf.expand_dims(tf.range(per_image_length * batch_size, delta=image.get_shape()[2] * image.get_shape()[3]), axis=1), (1, image.get_shape()[2] * image.get_shape()[3])), [batch_size, per_image_length])
 
     initial_arr = tf.to_float(initial_arr)
     index_array = tf.reshape(initial_arr + index_arr, [-1])
-    
+
     index_array_low = tf.clip_by_value(tf.to_int32(tf.floor(index_array)), 0, image.get_shape()[1] - 1)
     index_array_high = tf.clip_by_value(tf.to_int32(index_array_low + 1), 0, image.get_shape()[1] - 1)
     weight_low = tf.to_float(index_array_high) - index_array
@@ -139,7 +140,6 @@ def image_bias_move(image, disparity_map, batch_size=batch_size):
 
     new_image = tf.gather(tf.reshape(image, [-1]), index_array_low) * weight_low + tf.gather(tf.reshape(image, [-1]), index_array_high) * weight_high
     return tf.reshape(new_image, new_shape)
-
 
 # add LCN, window-optimizer and invalidation net later
 def loss_func(left_input, right_input, disparity_map):
@@ -151,23 +151,6 @@ def loss_func(left_input, right_input, disparity_map):
     #tf.summary.image('result', right, 2)
     l = tf.abs(right - left)
     return l
-    
-def stn(image):
-    with tf.variable_scope('stn', reuse=tf.AUTO_REUSE):
-        # params
-        n_fc = 6
-        B = batch_size
-        [H, W, C] = image.get_shape().as_list()[1:]
-        # identity transform
-        initial = np.array([[1., 0, 0], [0, 1., 0]])
-        initial = initial.astype('float32').flatten()
-        # localization network
-        W_fc1 = tf.Variable(tf.zeros([H * W * C, n_fc]), name='W_fc1')
-        b_fc1 = tf.Variable(initial_value=initial, name='b_fc1')
-        h_fc1 = tf.matmul(tf.zeros([B, H * W * C]), W_fc1) + b_fc1
-        # spatial transformer layer
-        h_trans = transformer(image, h_fc1)
-        return h_trans
 
 class batch_dataset:
     def __init__(self, batch_size=16):
@@ -227,6 +210,7 @@ def main(argv=None):
     print("var list length:", len(var_list))
 
     with tf.name_scope('loss'):
+        disparity_max = tf.reduce_max(disparity)
         loss = tf.reduce_mean(loss_func(x_placeholder, y_placeholder, disparity))
         #optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.5)
         optimizer = tf.train.RMSPropOptimizer(learning_rate=learning_rate)
@@ -245,9 +229,9 @@ def main(argv=None):
     for i in range(iterations):
         global_steps += 1
         left, right = reader.read_next_batch()
-        summary, Loss, _ = sess.run([merged, loss, train_op], feed_dict={x_placeholder: left, y_placeholder: right})
+        summary, Loss, m, _ = sess.run([merged, loss, disparity_max, train_op], feed_dict={x_placeholder: left, y_placeholder: right})
         if (i + 1) % 10 == 0:
-            print("iteration:", i + 1, "------------> training loss:", Loss)
+            print("iteration:", i + 1, "------------> training loss:", Loss, m)
             summary_writer.add_summary(summary, i + 1)
     return
 
